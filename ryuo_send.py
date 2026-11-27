@@ -38,16 +38,24 @@ from __future__ import annotations
 
 import argparse
 import platform
-import shutil
-import subprocess
 import sys
 import threading
 import time
 
-import hid
-
 import ryuo_hid
 import ryuo_proto as proto
+from ryuo_screen.client import (
+    API_PREFIX, ApiError, ServiceUnavailable, UnixApiClient, add_service_options,
+    direct_device, patch_state, print_state_result, slots_for_items,
+)
+from ryuo_screen.ownership import OwnershipError
+from ryuo_screen.store import ScreenState
+from ryuo_screen.telemetry.amd import AmdGpuProvider
+from ryuo_screen.telemetry.collector import TelemetryCollector, host_metrics
+from ryuo_screen.telemetry.cpu import CpuProvider
+from ryuo_screen.telemetry.hwmon import HwmonProvider
+from ryuo_screen.telemetry.nvidia import NvidiaProvider
+from ryuo_screen.telemetry.sysfs import Sysfs
 
 # The device answers about 8.5 requests a second and queues the rest with no
 # limit (PROTOCOL.md §1). 7 colour pushes plus 1 telemetry frame is the most
@@ -61,6 +69,8 @@ VID, PID = proto.VID, proto.PID
 # ------------------------------------------------------------------ transport
 
 def open_device(vid: int | None, pid: int, index: int | None = None):
+    import hid
+
     # vid=None means "any vendor id with this product id" -- the vendor id
     # changes between firmware versions, the product id does not.
     devs = proto.find_devices(hid, vid, pid)
@@ -119,50 +129,18 @@ def _cpu_name() -> str:
     return platform.processor() or "CPU"
 
 
-_NVIDIA_SMI: str | None | bool = False      # False = not looked up yet
+_NVIDIA_PROVIDER = NvidiaProvider(include_vram=False)
+_NVIDIA_TELEMETRY = TelemetryCollector([])
+_LINUX_TELEMETRY: TelemetryCollector | None = None
 
 
 def _nvidia() -> dict:
-    """GPU stats via nvidia-smi, if present.
-
-    Call this EVERY telemetry tick. It used to be called once before the main
-    loop and the result reused for the lifetime of the process, which froze
-    every GPU field -- temperature, load, clock, power -- at whatever it read
-    at startup. The panel looked alive because the CPU figures next to it kept
-    moving.
-
-    Only the executable lookup is cached; the query itself is re-run.
-    """
-    global _NVIDIA_SMI
-    if _NVIDIA_SMI is False:
-        _NVIDIA_SMI = shutil.which("nvidia-smi")
-    if not _NVIDIA_SMI:
+    """Return the legacy NVIDIA name/stats dict, with a fresh query each tick."""
+    snapshot = _NVIDIA_PROVIDER.sample()
+    if not snapshot.measurements:
         return {}
-    q = ("name,temperature.gpu,utilization.gpu,power.draw,"
-         "clocks.current.graphics,fan.speed")
-    try:
-        out = subprocess.run(
-            [_NVIDIA_SMI, f"--query-gpu={q}", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=2).stdout.strip().split("\n")[0]
-        name, temp, util, power, clock, fan = [x.strip() for x in out.split(",")]
-    except Exception:
-        return {}
-
-    # nvidia-smi prints "[N/A]" for anything the card can't report -- fan speed
-    # on laptops and passively cooled cards, power.draw on a lot of older GPUs.
-    # One unparseable field must not take the whole GPU with it, so each one
-    # degrades to 0 on its own.
-    def _num(x: str) -> int:
-        try:
-            return int(float(x))
-        except (TypeError, ValueError):
-            return 0
-
-    return {"name": name,
-            "stats": {"hasDedicated": True,
-                      "load": _num(util), "temperature": _num(temp),
-                      "fan": _num(fan), "speed": _num(clock),
-                      "power": _num(power), "voltage": 0}}
+    return {"name": _NVIDIA_PROVIDER.selected_name,
+            "stats": _NVIDIA_TELEMETRY.to_pc_info(snapshot)["gpu"]}
 
 
 def _cpu_temp(psutil) -> tuple[float, float]:
@@ -183,48 +161,130 @@ def _cpu_temp(psutil) -> tuple[float, float]:
     return 0.0, 0.0
 
 
-def collect(psutil, gpu: dict, extra_readouts: dict | None = None) -> dict:
-    vm = psutil.virtual_memory()
-    du = psutil.disk_usage("/" if platform.system() != "Windows" else "C:\\")
-    freq = psutil.cpu_freq()
-    load = psutil.cpu_percent()
-    t, tpkg = _cpu_temp(psutil)
-
+def _psutil_fans(psutil) -> list:
     fans = []
     try:
         for name, entries in (psutil.sensors_fans() or {}).items():
-            for e in entries:
-                fans.append({"onBoard": True, "name": e.label or name,
-                             "value": int(e.current)})
+            for entry in entries:
+                fans.append({"onBoard": True, "name": entry.label or name,
+                             "value": int(entry.current)})
     except Exception:
         pass
+    return fans
 
-    # Arbitrary labelled readouts. The screen renders any fans[] entry as
-    # "Fan Speed <name>", labelled with <name>, so this smuggles any number
-    # you can measure onto the panel. See proto.fan_item().
-    for label, value in (extra_readouts or {}).items():
-        fans.append({"onBoard": True, "name": label, "value": int(value)})
 
-    return proto.pc_info(
-        cpu={"load": int(load), "temperature": round(t), "temperaturePackage": round(tpkg),
-             "speedAverage": int(freq.current) if freq else 0,
-             "power": 0, "voltage": 0, "usage": int(load)},
-        gpu=gpu.get("stats") or {"hasDedicated": False, "load": 0, "temperature": 0,
-                                 "fan": 0, "speed": 0, "power": 0, "voltage": 0},
-        memory={"total": vm.total // (1024 ** 2),      # MB
-                "used": vm.used // (1024 ** 2),
-                "load": int(vm.percent), "temperature": 0, "speed": 0},
-        disk={"total": du.total // (1024 ** 3),        # GB
-              "used": du.used // (1024 ** 3),
-              "load": int(du.percent), "activity": 0,
-              "temperature": 0, "readSpeed": 0, "writeSpeed": 0},
-        network={"upload": 0, "download": 0},
-        motherboard={"temperature": 0, "chipsetTemperature": 0},
-        fans=fans,
-    )
+def _linux_telemetry() -> TelemetryCollector:
+    global _LINUX_TELEMETRY
+    if _LINUX_TELEMETRY is None:
+        sysfs = Sysfs()
+        _LINUX_TELEMETRY = TelemetryCollector([
+            CpuProvider(sysfs), HwmonProvider(sysfs), AmdGpuProvider(sysfs),
+        ])
+    return _LINUX_TELEMETRY
+
+
+def collect(psutil, gpu: dict, extra_readouts: dict | None = None) -> dict:
+    system = platform.system()
+    host = host_metrics(psutil, system)
+    memory, disk = host["memory"], host["disk"]
+    if system == "Linux":
+        collector = _linux_telemetry()
+        snapshot = collector.sample()
+        result = collector.to_pc_info(snapshot)
+        result.update(memory=memory, disk=disk)
+        if not result["fans"]:
+            result["fans"] = _psutil_fans(psutil)
+        cpu = result["cpu"]
+        available = {key for key, reading in snapshot.measurements.items() if reading.available}
+        if "cpu.load" not in available:
+            cpu["load"] = int(psutil.cpu_percent())
+            if "cpu.usage" not in snapshot.measurements:
+                cpu["usage"] = cpu["load"]
+        if "cpu.frequency" not in available:
+            freq = psutil.cpu_freq()
+            cpu["speedAverage"] = int(freq.current) if freq else 0
+        if not {"cpu.temperature", "cpu.temperature.package"} <= available:
+            temp, package = _cpu_temp(psutil)
+            if "cpu.temperature" not in available:
+                cpu["temperature"] = round(temp)
+            if "cpu.temperature.package" not in available:
+                cpu["temperaturePackage"] = round(package)
+        if gpu.get("stats"):
+            result["gpu"] = gpu["stats"]
+    else:
+        freq = psutil.cpu_freq()
+        load = psutil.cpu_percent()
+        temp, package = _cpu_temp(psutil)
+        result = proto.pc_info(
+            cpu={"load": int(load), "temperature": round(temp), "temperaturePackage": round(package),
+                 "speedAverage": int(freq.current) if freq else 0,
+                 "power": 0, "voltage": 0, "usage": int(load)},
+            gpu=gpu.get("stats") or {"hasDedicated": False, "load": 0, "temperature": 0,
+                                     "fan": 0, "speed": 0, "power": 0, "voltage": 0},
+            memory=memory,
+            disk=disk,
+            fans=_psutil_fans(psutil),
+        )
+
+    # An explicit --readout may still use the dynamic "Fan Speed <name>"
+    # widget. Native telemetry never maps other measurements to this widget.
+    result["fans"].extend({"onBoard": True, "name": label, "value": int(value)}
+                          for label, value in (extra_readouts or {}).items())
+    return result
 
 
 # ------------------------------------------------------------------ main
+
+def _service_compatible(args) -> bool:
+    split = args.media2 is not None
+    screen_mode = proto.MODE_SPLIT if split else proto.MODE_FULL
+    return not (
+        args.direct or args.vid is not None or args.pid is not None
+        or args.index is not None or args.readout
+        or args.timezone is not None or args.demo_temp is not None
+        or args.rgb_speed != 0.2 or args.rgb_fps != RGB_FPS
+        or args.screen_mode not in (None, screen_mode)
+        or not split and any(value is not None for value in (
+            args.play_mode2, args.title_color2, args.content_color2
+        ))
+    )
+
+
+def _run_service(args, client, state) -> None:
+    play_mode = proto.PLAY_RANDOM if args.shuffle else args.play_mode
+    split = args.media2 is not None
+    screen = {
+        "screen_mode": proto.MODE_SPLIT if split else proto.MODE_FULL,
+        "slots": slots_for_items(proto.sysinfo_slots(*args.items), client),
+        "media": [args.media],
+        "playback_modes": [play_mode],
+        "title_colors": [args.title_color],
+        "content_colors": [args.content_color],
+        "opacity": args.opacity,
+        "rgb_mode": "off" if args.rgb == "off" else args.rgb_mode,
+        "rgb_target": "value" if args.rgb == "off" else args.rgb,
+        "thermal_source": args.rgb_source + ".temperature",
+    }
+    if split:
+        screen["media"].append(args.media2)
+        screen["playback_modes"].append(args.play_mode2 or play_mode)
+        screen["title_colors"].append(args.title_color2 or args.title_color)
+        screen["content_colors"].append(args.content_color2 or args.content_color)
+    brightness = {"brightness": args.brightness}
+    telemetry = {"temperature_unit": args.unit, "refresh_interval": args.interval}
+    # Validate the full config before sending the first independent mutation.
+    ScreenState(**screen, **brightness, **telemetry)
+    if len(args.items) > proto.SLOTS:
+        print(f"note: only the first {proto.SLOTS} items fit on the panel", file=sys.stderr)
+
+    for operation, changes in (
+        ("screen", screen), ("brightness", brightness), ("telemetry-settings", telemetry),
+    ):
+        if operation != "screen":
+            state = client.request("GET", API_PREFIX + "/state")
+        result = patch_state(client, state, "/" + operation, **changes)
+        print_state_result(dict(result, operation=operation))
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -232,13 +292,14 @@ def main() -> None:
                     help="pin a vendor id; default is to accept any, since it "
                          "changes between firmware versions (0B05 on 1.0.3 and "
                          "1.0.10, 1C75 on 1.0.7)")
-    ap.add_argument("--pid", type=lambda x: int(x, 0), default=PID)
+    ap.add_argument("--pid", type=lambda x: int(x, 0))
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--index", type=int, default=None,
                     help="which enumerated interface to open (see --list); "
                          f"default: the one with interface_number={proto.INTERFACE}")
     ap.add_argument("--config-only", action="store_true",
-                    help="push the config and exit (screen reverts after ~10s)")
+                    help="push the config and exit (in direct mode the screen "
+                         "reverts after ~10s)")
     ap.add_argument("--items", nargs="*",
                     default=["CPU Temperature", "GPU Temperature", "Date&Time"],
                     help="up to 6; slot order == on-screen position")
@@ -302,15 +363,21 @@ def main() -> None:
                     help="IANA zone for the Date&Time widget; "
                          "defaults to the host's")
     ap.add_argument("--unit", default="Celsius", choices=["Celsius", "Fahrenheit"])
-    ap.add_argument("--interval", type=float, default=1.0)
+    ap.add_argument("--interval", type=float, default=1.0,
+                    help="refresh interval in seconds (direct HID loop or "
+                         "persisted service telemetry setting)")
     ap.add_argument("-v", "--verbose", action="store_true")
+    add_service_options(ap)
     args = ap.parse_args()
+    pid = PID if args.pid is None else args.pid
 
     if args.list:
-        found = proto.find_devices(hid, args.vid, args.pid)
+        import hid
+
+        found = proto.find_devices(hid, args.vid, pid)
         if not found:
-            ids = (f"{args.vid:04X}:{args.pid:04X}" if args.vid
-                   else f"any vendor with product {args.pid:04X}")
+            ids = (f"{args.vid:04X}:{pid:04X}" if args.vid
+                   else f"any vendor with product {pid:04X}")
             print(f"nothing enumerating as {ids}")
         for i, d in enumerate(found):
             print(f"[{i}] usage_page={d.get('usage_page'):#06x} "
@@ -318,6 +385,22 @@ def main() -> None:
                   f"product={d.get('product_string')!r}")
         return
 
+    try:
+        if _service_compatible(args):
+            client = UnixApiClient(args.socket)
+            try:
+                state = client.request("GET", API_PREFIX + "/state")
+            except ServiceUnavailable:
+                pass
+            else:
+                _run_service(args, client, state)
+                return
+        _run_direct(args, pid)
+    except (ApiError, OwnershipError, ValueError) as ex:
+        sys.exit(f"error: {ex}")
+
+
+def _run_direct(args, pid) -> None:
     try:
         import psutil
     except ImportError:
@@ -386,7 +469,11 @@ def main() -> None:
         sys.exit(f"{ex}.\nThe config carries the playlist, widget slots, CPU/GPU "
                  f"names and time zone; shorten the playlist or the file names.")
 
-    h = open_device(args.vid, args.pid, args.index)
+    with direct_device(args.socket, open_device, args.vid, pid, args.index) as h:
+        _send_direct(h, args, cfg, media, play_mode, psutil, gpu, readouts)
+
+
+def _send_direct(h, args, cfg, media, play_mode, psutil, gpu, readouts) -> None:
     seq = 1
 
     ap_settle = 1.6   # case 14 does postDelayed(doBlockScreen, 1000L)
@@ -406,7 +493,6 @@ def main() -> None:
 
     if args.config_only:
         time.sleep(ap_settle)
-        h.close()
         return
 
     # let the video player finish re-initialising before we touch anything else
@@ -516,7 +602,6 @@ def main() -> None:
             txn(h, proto.POST, proto.RES_DISCONN, None, seq)
         except Exception:
             pass
-        h.close()
 
 
 if __name__ == "__main__":
